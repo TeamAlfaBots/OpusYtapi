@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+yt-dlp
+python-dotenv
+aiohttp
+motor
+cryptography
+tzdata
+# key-manager bot (PyroTGFork installs the `pyrogram` module)
+pyrotgfork
+tgcrypto

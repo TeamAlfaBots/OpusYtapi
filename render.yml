@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: opus-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    branch: main
+    healthCheckPath: /ping
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: BASE_URL
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: opusapi
+      - key: KEY_ENC_SECRET
+        sync: false
+      - key: TOKEN_SECRET
+        sync: false
+      - key: TELEGRAM_CACHE_CHANNEL
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: TELEGRAM_MAX_SONG_MB
+        value: 25
+      - key: PROXIES
+        sync: false
+      - key: COOKIES_B64
+        sync: false
+      - key: ADMIN_KEY
+        sync: false
+      - key: MIN_FREE_MB
+        value: 500
+      # Bot settings (only needed when RUN_BOT_WITH_API=true)
+      - key: RUN_BOT_WITH_API
+        value: "false"
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: FORCE_CHANNELS
+        sync: false
