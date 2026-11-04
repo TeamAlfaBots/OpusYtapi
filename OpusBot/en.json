@@ -1,6 +1,6 @@
 {
   "texts": {
-    "start": "👋 Hey <b>{name}</b>!\n\nThis is the <b>OpusMusicAPI Manager</b> bot.\nGenerate your API key, check your usage, renew or revoke it, all from here.\n\n🎵 Fast, cached YouTube audio for your Telegram music bots.\n👇 Tap a button below to continue.",
+    "start": "👋 Hey <b>{name}</b>!\n\nThis is the <b>OpusMusicAPI Manager</b> bot.\nGenerate your API key, check your usage, renew or revoke it, all from here.\n\n🎵 Fast, cached YouTube audio for your Telegram music bots.\n<b>✦ What you can do here:\n➨ Generate your API key\n➨Check your usage stats\n➨Renew your key</b>\n👇 Tap a button below to continue.",
     "join_required": "🔒 <b>Join required</b>\n\nTo generate your API key, please join our channel(s) first:\n{channels}\n\nThen tap <b>✅ I've Joined</b>.",
     "join_error": "⚠️ I couldn't verify your channel membership right now. Please try again in a moment.",
     "join_still": "You haven't joined all the channels yet!",
