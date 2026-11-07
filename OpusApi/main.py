@@ -9,6 +9,7 @@ import hmac
 import logging
 import os
 import time
+import re
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -30,7 +31,8 @@ _bg = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    downloader.prepare_cookies()
+    await downloader.load_cookies()
+    _cookie_task = asyncio.create_task(downloader.cookies_refresh_loop())
     downloader.startup_cleanup()
     await mongo.init_mongo()          # non-fatal: auth answers 503 until Mongo is back
     await telegram_cache.start()  # non-fatal: API still works when Telegram cache is unavailable
@@ -45,6 +47,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.error("Could not start the bot: %s", e)
     yield
+    _cookie_task.cancel()
     await telegram_cache.stop()
     if _bot["client"] is not None:
         try:
@@ -107,12 +110,27 @@ def _safe_remove(path: str):
         pass
 
 
+class _RedactSecrets(logging.Filter):
+    """Never write API keys / download tokens (sent in the URL) to the access log."""
+
+    _RE = re.compile(r"(api_key|token)=[^&\s\"]+", re.I)
+
+    def filter(self, record):
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._RE.sub(r"\1=***", a) if isinstance(a, str) else a for a in record.args
+            )
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactSecrets())
+
 router = APIRouter()
 
 
 @router.get("/me")
-async def me(x_api_key: str | None = Header(default=None)):
-    key = x_api_key
+async def me(x_api_key: str | None = Header(default=None), api_key: str | None = None):
+    key = x_api_key or api_key
     if not key:
         raise _err(401, "missing_key", "Send your API key in the X-API-Key header.")
     try:
@@ -139,8 +157,9 @@ async def generate_token(
     url: str,
     type: str = "audio",
     x_api_key: str | None = Header(default=None),
+    api_key: str | None = None,  # legacy clients send ?api_key=
 ):
-    key = x_api_key
+    key = x_api_key or api_key
     if not key:
         raise _err(401, "missing_key", "Send your API key in the X-API-Key header.")
     try:
@@ -287,3 +306,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=config.PORT)
+       
