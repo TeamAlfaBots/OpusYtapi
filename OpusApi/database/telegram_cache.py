@@ -114,6 +114,56 @@ async def get_cached_song(video_id: str, type_: str = "audio"):
         return None
 
 
+CHUNK = 1024 * 1024  # Telegram's download chunk size (stream_media works in chunks of 1 MiB)
+
+
+async def open_stream(video_id: str):
+    """Look up a cached song for direct streaming. Downloads NOTHING.
+
+    -> {"message", "size", "ext"} or None (not cached / Telegram unavailable).
+    """
+    if not _started:
+        return None
+    try:
+        doc = await _collection().find_one({"video_id": video_id, "type": "audio"})
+        if not doc:
+            return None
+        message = await _client.get_messages(_chat_id(), int(doc["message_id"]))
+        media = None if (not message or getattr(message, "empty", False)) else (message.audio or message.document)
+        if media is None:
+            await _collection().delete_one({"_id": doc["_id"]})  # message was deleted: forget it
+            return None
+        size = int(getattr(media, "file_size", 0) or doc.get("size_bytes") or 0)
+        if size <= 0:
+            return None
+        ext = re.sub(r"[^a-z0-9]", "", (doc.get("ext") or "mp3").lower())[:5] or "mp3"
+        await _collection().update_one({"_id": doc["_id"]}, {"$set": {"last_accessed": int(time.time())}})
+        return {"message": message, "size": size, "ext": ext}
+    except Exception as e:
+        log.warning("Telegram stream lookup failed for %s: %s", video_id, e)
+        return None
+
+
+async def iter_range(message, start: int, end: int):
+    """Yield the bytes start..end (inclusive) of a cached song, straight from Telegram."""
+    first = start // CHUNK
+    skip = start - first * CHUNK
+    need = end - start + 1
+    chunks = (skip + need + CHUNK - 1) // CHUNK
+    async for chunk in _client.stream_media(message, limit=chunks, offset=first):
+        if skip:
+            chunk = chunk[skip:]
+            skip = 0
+        if len(chunk) > need:
+            chunk = chunk[:need]
+        if not chunk:
+            continue
+        need -= len(chunk)
+        yield chunk
+        if need <= 0:
+            break
+
+
 async def save_song(video_id: str, type_: str, ext: str, path: str) -> bool:
     """Upload a fresh audio file to the private cache channel and index its message."""
     if not _started or type_ != "audio" or not os.path.isfile(path):
@@ -166,3 +216,4 @@ async def get_cache_stats() -> dict:
         return {"enabled": True, "status": "ok", "songs": count, "size_mb": round(size / 1048576, 2)}
     except Exception as e:
         return {"enabled": True, "status": "error", "error": str(e)[:120]}
+        
