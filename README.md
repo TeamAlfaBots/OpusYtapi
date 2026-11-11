@@ -2,21 +2,24 @@
 
 Public YouTube **audio** API + Telegram **key-manager bot**, built to run on free hosting.
 
-* **API** (`OpusApi/`, FastAPI): API-key auth, 200 requests/day per user, 28-day keys, yt-dlp engine with strict concurrency limits.
+* **API** (`OpusApi/`, FastAPI): API-key auth, 150 requests/day per user (change with `DAILY_LIMIT`), 28-day keys, yt-dlp engine with strict concurrency limits.
 * **Cache**: songs are archived in a **private Telegram channel**; MongoDB stores message IDs and metadata. The local disk cache handles repeat requests quickly.
+* **Direct stream**: a cached song that is not on disk is sent **straight from the Telegram channel to the user** (no download first), with HTTP Range / seek support. Turn off with `TELEGRAM_STREAM=false`.
+* **`/test song name`** (bot): searches the song, downloads it through the API, sends it in the chat and caches it. It is charged to the **user's own key and quota**. Owners in `OWNER_IDS` use the master key.
+* **Master key**: `MASTER_KEY` (24+ chars) = unlimited quota, no rate limit. Owner only.
 * **Users/keys/usage**: **MongoDB** (nothing important lives in memory or on disk).
 * **Bot** (`OpusBot/`, Pyrogram): `/start` → Generate API → join channels → key card (Revoke / Renew / Report Bug). Owner tools: `/broadcast`, `/users`, `/revoke`, `/setlimit`.
 
 ## Quick start
 
 ```bash
-cp .env.example .env        # fill it in
+cp example.env .env         # fill it in
 pip install -r requirements.txt
 uvicorn OpusApi.main:app --port 8000      # API
 python -m OpusBot                         # key-manager bot (separate process)
 python -m tests.test_core                 # offline tests
 ```
-Or set `RUN_BOT_WITH_API=true` to run the bot inside the API process (one free service; needs more RAM).
+The bot runs inside the API process by default (`RUN_BOT_WITH_API=true`, one service). Set `RUN_BOT_WITH_API=false` to run it separately.
 Requires `ffmpeg`, `yt-dlp` and `deno` on the server (the Dockerfile installs them).
 
 ## Using the API
@@ -27,7 +30,10 @@ GET {BASE_URL}/v1/download?url=<video id or link>&type=audio     Header: X-API-K
 GET {BASE_URL}/v1/stream/<video_id>?token=<download_token>
   -> the audio file (headers X-Requests-Remaining, X-Daily-Limit)
 GET {BASE_URL}/v1/me                                             Header: X-API-Key
+GET {BASE_URL}/v1/search?q=<song name>                           Header: X-API-Key   (free, not charged)
+  -> {"video_id": "...", "title": "...", "duration": 212, "uploader": "..."}
 ```
+Full guide with code examples, error codes and the master key: **[DOCS.md](DOCS.md)**.
 Paths without `/v1` still work. Errors are JSON: `{"status":"error","code":"daily_limit","message":"..."}`
 (codes: `invalid_key`, `key_expired`, `rate_limited`, `daily_limit`, `busy`, `download_failed`, ...).
 
@@ -42,5 +48,7 @@ Paths without `/v1` still work. Errors are JSON: `{"status":"error","code":"dail
 3. **Back up `KEY_ENC_SECRET`.** If it is lost, existing keys still work but the bot cannot display them (users must Revoke → Generate New).
 4. MongoDB Atlas free: allow `0.0.0.0/0` in Network Access (Render IPs change) and use a strong DB password.
 5. Rotate any proxy credentials that were ever committed in the old version.
-6. Free-tier safety knobs: `MAX_CONCURRENT_DOWNLOADS`, `MAX_QUEUE`, `DOWNLOAD_TIMEOUT`, `RATE_PER_MIN`, `ALLOW_VIDEO`.
-7. Bot setup: add the bot as **admin** in every `FORCE_CHANNELS` channel (needed to check membership). Texts are in `OpusBot/en.json`.
+6. New knobs: `MASTER_KEY`, `TELEGRAM_STREAM`, `TEST_MAX_MINUTES` (longest song `/test` accepts, default 10).
+7. All defaults live in `OpusApi/config.py` (video is OFF by default, set `ALLOW_VIDEO=true` to enable). Only secrets are required in the environment. Free-tier safety knobs: `MAX_CONCURRENT_DOWNLOADS`, `MAX_QUEUE`, `DOWNLOAD_TIMEOUT`, `RATE_PER_MIN`, `ALLOW_VIDEO`.
+8. Bot setup: add the bot as **admin** in every `FORCE_CHANNELS` channel (needed to check membership). Texts are in `OpusBot/en.json`.
+9. 
