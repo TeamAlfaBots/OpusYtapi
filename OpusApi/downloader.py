@@ -43,6 +43,25 @@ class DownloadError(Exception):
     """yt-dlp failed. str(e) is safe to show to API users."""
 
 
+class RangeNotSatisfiable(Exception):
+    """Range header starts beyond the end of the file (HTTP 416)."""
+
+    def __init__(self, size: int):
+        super().__init__("range not satisfiable")
+        self.size = size
+
+
+@dataclass
+class TgStream:
+    """A cached song that is streamed straight from Telegram to the user."""
+    body: object             # async generator of bytes (already primed with its first chunk)
+    media_type: str
+    size: int                # full file size
+    start: int
+    end: int                 # inclusive
+    partial: bool            # True -> answer 206
+
+
 @dataclass
 class Media:
     path: str
@@ -493,6 +512,151 @@ async def get_media(video_id: str, type_: str) -> Media:
         raise
     COUNTERS["downloads"] += 1
     return Media(tmp, media_type_for(tmp.rsplit(".", 1)[-1], "video"), "download", delete_after=True)
+
+
+async def stream_from_telegram(video_id: str, range_header=None):
+    """Cached song -> TgStream that sends it from the Telegram channel with NO disk copy.
+
+    Returns None when the song is not cached or streaming is not possible (the caller then
+    falls back to disk / yt-dlp). Raises RangeNotSatisfiable for a bad Range header.
+    """
+    if not config.TELEGRAM_STREAM or not telegram_cache.enabled():
+        return None
+    info = await telegram_cache.open_stream(video_id)
+    if not info:
+        return None
+    size = info["size"]
+    try:
+        rng = utils.parse_range(range_header, size)
+    except ValueError:
+        raise RangeNotSatisfiable(size)
+    start, end = rng or (0, size - 1)
+
+    it = telegram_cache.iter_range(info["message"], start, end).__aiter__()
+    try:  # prime: if Telegram fails now we can still fall back to the normal path
+        first = await asyncio.wait_for(it.__anext__(), timeout=30)
+    except Exception as e:
+        log.warning("Telegram stream failed for %s: %s", video_id, type(e).__name__)
+        try:
+            await it.aclose()
+        except Exception:
+            pass
+        return None
+
+    async def body():
+        acquired = False
+        try:
+            await _cache_sem.acquire()   # limit simultaneous streams on the one Telegram session
+            acquired = True
+            yield first
+            async for chunk in it:
+                yield chunk
+        finally:
+            if acquired:
+                _cache_sem.release()
+            try:
+                await it.aclose()
+            except Exception:
+                pass
+
+    COUNTERS["telegram_hits"] += 1
+    return TgStream(
+        body=body(),
+        media_type=media_type_for(info["ext"], "audio"),
+        size=size, start=start, end=end, partial=rng is not None,
+    )
+
+
+# ── search (used by the bot's /test and GET /v1/search) ──────
+_SEARCH_CACHE = {}
+_SEARCH_TTL = 600
+
+
+def _search_cmd(query, cookies, proxy) -> list:
+    cmd = ["yt-dlp", "--quiet", "--no-warnings", "--flat-playlist", "--socket-timeout", "20", *cookies]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    # One argument starting with "ytsearch3:" can never be parsed as an option.
+    cmd += ["--print", "%(id)s\t%(title)s\t%(duration)s\t%(uploader)s", "ytsearch3:" + query]
+    return cmd
+
+
+async def _run_out(cmd, timeout):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _kill(proc)
+        await proc.wait()
+        return -9, "", "timeout"
+    except asyncio.CancelledError:
+        _kill(proc)
+        raise
+    return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
+
+
+def _parse_search(out: str):
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4 or not utils.extract_video_id(parts[0]):
+            continue
+        try:
+            duration = int(float(parts[2]))
+        except ValueError:
+            duration = 0            # live streams / unknown length
+        return {"video_id": parts[0], "title": parts[1][:200], "duration": duration,
+                "uploader": ("" if parts[3] in ("NA", "None") else parts[3])[:100]}
+    return None
+
+
+async def search_video(query: str) -> dict:
+    """Song name -> {video_id, title, duration, uploader}. Raises Busy / DownloadError."""
+    query = re.sub(r"\s+", " ", query or "").strip()[:100]
+    if len(query) < 2:
+        raise DownloadError("Type a song name (at least 2 letters)")
+    key = query.lower()
+    hit = _SEARCH_CACHE.get(key)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+
+    async def work():
+        cookie_copy = os.path.join(tempfile.gettempdir(), f"opus_ck_{uuid.uuid4().hex[:10]}.txt")
+        try:
+            cookies = []
+            if os.path.isfile(_RUNTIME_COOKIES):
+                shutil.copyfile(_RUNTIME_COOKIES, cookie_copy)
+                cookies = ["--cookies", cookie_copy]
+            tries = proxy_order()[: config.MAX_PROXY_TRIES] if PROXIES else [None]
+            last = ""
+            for proxy in tries:
+                rc, out, err = await _run_out(_search_cmd(query, cookies, proxy), min(30, config.DOWNLOAD_TIMEOUT))
+                if rc == 0:
+                    if proxy:
+                        mark_proxy_ok(proxy)
+                    found = _parse_search(out)
+                    if found:
+                        return found
+                    raise DownloadError("No result found for this name")
+                last = err
+                if proxy and _proxy_related(rc, err):
+                    mark_proxy_fail(proxy)
+                    continue
+                break
+            log.warning("yt-dlp search failed: %s", _sanitize(last))
+            raise DownloadError("Search failed, try again")
+        finally:
+            try:
+                os.remove(cookie_copy)
+            except OSError:
+                pass
+
+    result = await _limited(work)
+    if len(_SEARCH_CACHE) > 500:
+        _SEARCH_CACHE.clear()
+    _SEARCH_CACHE[key] = (time.monotonic() + _SEARCH_TTL, result)
+    return result
 
 
 def _read_bytes(path: str) -> bytes:
