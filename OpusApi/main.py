@@ -14,7 +14,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTasks
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -25,12 +25,17 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("opusapi")
 
 START_TIME = time.time()
+MASTER_ID = 0   # pseudo user id used in tokens made with the owner's MASTER_KEY
 _bot = {"client": None, "task": None}
 _bg = set()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if config.MASTER_KEY_TOO_SHORT:
+        log.warning("MASTER_KEY is shorter than 24 characters and was IGNORED. Use a long random value.")
+    elif config.MASTER_KEY:
+        log.info("Master key enabled (unlimited owner access)")
     await downloader.load_cookies()
     _cookie_task = asyncio.create_task(downloader.cookies_refresh_loop())
     downloader.startup_cleanup()
@@ -97,7 +102,34 @@ def _rate_check(tg_id: int):
     dq.append(now)
 
 
+def _is_master(key) -> bool:
+    """True when `key` is the owner's MASTER_KEY (constant-time compare)."""
+    return bool(config.MASTER_KEY and key and
+                hmac.compare_digest(key.encode(), config.MASTER_KEY.encode()))
+
+
+async def _auth(key) -> int:
+    """API key -> telegram id (MASTER_ID for the master key). Raises the proper API error."""
+    if not key:
+        raise _err(401, "missing_key", "Send your API key in the X-API-Key header.")
+    if _is_master(key):
+        return MASTER_ID
+    try:
+        state, tg_id = await mongo.lookup_key(key)
+    except Exception as e:
+        log.error("mongo error: %s", e)
+        raise _err(503, "auth_unavailable", "Auth service temporarily unavailable.")
+    if state in ("invalid", "revoked"):
+        raise _err(401, "invalid_key", "Invalid or revoked API key.")
+    if state == "expired":
+        raise _err(401, "key_expired", "API key expired. Renew it in the manager bot.")
+    _rate_check(tg_id)
+    return tg_id
+
+
 def _refund_bg(tg_id: int):
+    if tg_id == MASTER_ID:   # the master key is never charged
+        return
     task = asyncio.create_task(mongo.refund(tg_id))
     _bg.add(task)
     task.add_done_callback(_bg.discard)
@@ -133,6 +165,10 @@ async def me(x_api_key: str | None = Header(default=None), api_key: str | None =
     key = x_api_key or api_key
     if not key:
         raise _err(401, "missing_key", "Send your API key in the X-API-Key header.")
+    if _is_master(key):
+        return {"status": "success", "plan": "master", "key_state": "ok", "expires_at": None,
+                "requests_today": 0, "daily_limit": None, "unlimited": True,
+                "resets_in_seconds": utils.seconds_until_reset()}
     try:
         state, tg_id = await mongo.lookup_key(key)
         doc = await mongo.get_user(tg_id) if tg_id else None
@@ -159,20 +195,7 @@ async def generate_token(
     x_api_key: str | None = Header(default=None),
     api_key: str | None = None,  # legacy clients send ?api_key=
 ):
-    key = x_api_key or api_key
-    if not key:
-        raise _err(401, "missing_key", "Send your API key in the X-API-Key header.")
-    try:
-        state, tg_id = await mongo.lookup_key(key)
-    except Exception as e:
-        log.error("mongo error: %s", e)
-        raise _err(503, "auth_unavailable", "Auth service temporarily unavailable.")
-    if state in ("invalid", "revoked"):
-        raise _err(401, "invalid_key", "Invalid or revoked API key.")
-    if state == "expired":
-        raise _err(401, "key_expired", "API key expired. Renew it in the manager bot.")
-
-    _rate_check(tg_id)
+    tg_id = await _auth(x_api_key or api_key)
 
     type = (type or "audio").lower()
     if type not in ("audio", "video"):
@@ -193,8 +216,26 @@ async def generate_token(
     }
 
 
+@router.get("/search")
+async def search_song(
+    q: str,
+    x_api_key: str | None = Header(default=None),
+    api_key: str | None = None,
+):
+    """Song name -> best YouTube match. Free (not charged), but rate limited per key."""
+    await _auth(x_api_key or api_key)
+    try:
+        found = await downloader.search_video(q)
+    except downloader.Busy:
+        raise _err(503, "busy", "Server is busy, retry in a few seconds.", {"Retry-After": "10"})
+    except downloader.DownloadError as e:
+        raise _err(404, "not_found", str(e))
+    return {"status": "success", **found}
+
+
 @router.get("/stream/{video_id}")
 async def stream_music(
+    request: Request,
     video_id: str,
     token: str | None = None,
     x_download_token: str | None = Header(default=None),
@@ -209,31 +250,65 @@ async def stream_music(
         raise _err(401, "invalid_token", "Invalid token.")
     if claims["video_id"] != video_id:
         raise _err(401, "token_mismatch", "Token does not belong to this video.")
-    return await _serve(claims["tg_id"], video_id, claims["type"])
+    return await _serve(claims["tg_id"], video_id, claims["type"], request)
 
 
-async def _serve(tg_id: int, video_id: str, type_: str):
-    """Charge 1 request, fetch/convert the media and return it as a file response."""
-    # Charge BEFORE doing any heavy work (atomic). Refund if we fail.
+async def _serve(tg_id: int, video_id: str, type_: str, request: Request | None = None):
+    """Charge 1 request, then send the media (disk -> Telegram stream -> fresh download)."""
+    if tg_id == MASTER_ID:
+        if not config.MASTER_KEY:   # master key was removed: its old tokens die too
+            raise _err(401, "invalid_token", "Invalid token.")
+        charge = {"state": "ok", "used": 0, "limit": 0, "unlimited": True}
+    else:
+        # Charge BEFORE doing any heavy work (atomic). Refund if we fail.
+        try:
+            charge = await mongo.consume(tg_id)
+        except Exception as e:
+            log.error("mongo error: %s", e)
+            raise _err(503, "auth_unavailable", "Auth service temporarily unavailable.")
+        if charge["state"] == "invalid":
+            raise _err(401, "invalid_key", "API key is invalid or revoked.")
+        if charge["state"] == "expired":
+            raise _err(401, "key_expired", "API key expired. Renew it in the manager bot.")
+        if charge["state"] == "quota":
+            wait = utils.seconds_until_reset()
+            raise _err(
+                429, "daily_limit",
+                f"Daily limit of {charge['limit']} requests reached. Resets in {utils.fmt_duration(wait)}.",
+                {"Retry-After": str(wait)},
+            )
+
+    quota_headers = {
+        "X-Requests-Remaining": "unlimited" if charge.get("unlimited") else str(max(0, charge["limit"] - charge["used"])),
+        "X-Daily-Limit": "unlimited" if charge.get("unlimited") else str(charge["limit"]),
+    }
+
     try:
-        charge = await mongo.consume(tg_id)
-    except Exception as e:
-        log.error("mongo error: %s", e)
-        raise _err(503, "auth_unavailable", "Auth service temporarily unavailable.")
-    if charge["state"] == "invalid":
-        raise _err(401, "invalid_key", "API key is invalid or revoked.")
-    if charge["state"] == "expired":
-        raise _err(401, "key_expired", "API key expired. Renew it in the manager bot.")
-    if charge["state"] == "quota":
-        wait = utils.seconds_until_reset()
-        raise _err(
-            429, "daily_limit",
-            f"Daily limit of {charge['limit']} requests reached. Resets in {utils.fmt_duration(wait)}.",
-            {"Retry-After": str(wait)},
-        )
-
-    try:
+        # Fastest path for cached songs that are not on disk: stream them straight from the
+        # Telegram channel (no download first). Falls through to the normal path on any problem.
+        if type_ == "audio" and not downloader.find_cached_file(video_id):
+            tgs = await downloader.stream_from_telegram(
+                video_id, request.headers.get("range") if request is not None else None
+            )
+            if tgs:
+                log.info("served %s type=audio source=telegram-stream user=%s", video_id, tg_id)
+                headers = {
+                    **quota_headers,
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(tgs.end - tgs.start + 1),
+                    "X-Source": "telegram-stream",
+                }
+                if tgs.partial:
+                    headers["Content-Range"] = f"bytes {tgs.start}-{tgs.end}/{tgs.size}"
+                return StreamingResponse(
+                    tgs.body, status_code=206 if tgs.partial else 200,
+                    media_type=tgs.media_type, headers=headers,
+                )
         media = await downloader.get_media(video_id, type_)
+    except downloader.RangeNotSatisfiable as e:
+        _refund_bg(tg_id)
+        raise _err(416, "range_not_satisfiable", "Requested range is outside the file.",
+                   {"Content-Range": f"bytes */{e.size}"})
     except downloader.Busy:
         _refund_bg(tg_id)
         raise _err(503, "busy", "Server is busy, retry in a few seconds.", {"Retry-After": "10"})
@@ -258,16 +333,14 @@ async def _serve(tg_id: int, video_id: str, type_: str):
         media.path,
         media_type=media.media_type,
         background=tasks,
-        headers={
-            "X-Requests-Remaining": str(max(0, charge["limit"] - charge["used"])),
-            "X-Daily-Limit": str(charge["limit"]),
-        },
+        headers={**quota_headers, "X-Source": media.source},
     )
 
 
 app.include_router(router, prefix="/v1")
 @app.get("/download", include_in_schema=False)
 async def legacy_download(
+    request: Request,
     url: str,
     type: str = "audio",
     x_api_key: str | None = Header(default=None),
@@ -280,7 +353,7 @@ async def legacy_download(
         return await generate_token(url=url, type=type, x_api_key=x_api_key, api_key=api_key)
     info = await generate_token(url=url, type=type, x_api_key=x_api_key, api_key=api_key)
     claims, _ = security.verify_token(info["download_token"])
-    return await _serve(claims["tg_id"], claims["video_id"], claims["type"])
+    return await _serve(claims["tg_id"], claims["video_id"], claims["type"], request)
 
 
 app.include_router(router, include_in_schema=False)  # legacy: /download, /stream
