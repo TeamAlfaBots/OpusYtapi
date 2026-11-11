@@ -48,6 +48,33 @@ def parse_proxy(raw):
     return None
 
 
+def parse_range(header, size: int):
+    """HTTP Range header -> (start, end) inclusive, or None to send the whole file.
+
+    Only a single range is supported (what players and bots send). A malformed or
+    multi-range header is ignored (whole file). Raises ValueError when the range
+    starts beyond the end of the file (answer 416).
+    """
+    if not header or size <= 0:
+        return None
+    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", header)
+    if not m or (not m.group(1) and not m.group(2)):
+        return None
+    a, b = m.group(1), m.group(2)
+    if not a:                      # suffix: the last N bytes
+        n = int(b)
+        if n == 0:
+            raise ValueError("unsatisfiable")
+        return max(0, size - n), size - 1
+    start = int(a)
+    end = int(b) if b else size - 1
+    if b and end < start:
+        return None                # invalid -> ignore the header
+    if start >= size:
+        raise ValueError("unsatisfiable")
+    return start, min(end, size - 1)
+
+
 def shard_index(video_id: str, n: int) -> int:
     """Stable shard for a video id. md5 (NOT hash()) so it survives restarts."""
     return int(hashlib.md5(video_id.encode()).hexdigest(), 16) % n
@@ -88,3 +115,4 @@ def fmt_duration(seconds: int) -> str:
     h, rem = divmod(int(seconds), 3600)
     m = rem // 60
     return f"{h}h {m}m" if h else f"{m}m"
+    
