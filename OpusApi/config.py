@@ -1,7 +1,8 @@
 """Central configuration.
 
-Every value is read from environment variables (or a local .env file).
-Nothing is hardcoded in the code: see .env.example for the full list.
+Every setting has a ready default HERE, so the environment / .env only needs the
+secrets (Mongo, Telegram, keys). Set an environment variable only to override a default.
+See example.env for the list of secrets.
 """
 import os
 
@@ -53,38 +54,44 @@ def _channel(value: str) -> str:
 
 # ── Public API ───────────────────────────────────────────────
 BASE_URL = _s("BASE_URL").rstrip("/")
-PORT = _i("PORT", 8080)
+PORT = _i("PORT", 3000)
 CACHE_DIR = _s("CACHE_DIR") or os.path.join(ROOT_DIR, "OpusApi", "saved")
 COOKIES_FILE = _s("COOKIES_FILE") or os.path.join(ROOT_DIR, "cookies.txt")
 COOKIES_B64 = _s("COOKIES_B64")
 COOKIES_URL = _s("COOKIES_URL")  # direct link to a cookies.txt (keep it private!)
 COOKIES_REFRESH_HOURS = _f("COOKIES_REFRESH_HOURS", 6.0)  # re-download COOKIES_URL every N hours, 0 = never
 ADMIN_KEY = _s("ADMIN_KEY")
-RUN_BOT_WITH_API = _b("RUN_BOT_WITH_API", False)
+RUN_BOT_WITH_API = _b("RUN_BOT_WITH_API", True)
 BUTTON_STYLES = _b("BUTTON_STYLES", True)  # coloured inline buttons (Bot API 9.4+)
 # Root /download returns the audio file directly (what music bots expect). false = JSON token
 LEGACY_DIRECT_DOWNLOAD = _b("LEGACY_DIRECT_DOWNLOAD", True)
-ALLOW_VIDEO = _b("ALLOW_VIDEO", True)
+ALLOW_VIDEO = _b("ALLOW_VIDEO", False)   # off by default: video needs ffmpeg merge + lots of disk (1 GB hosts)
+# Cached songs are sent straight from the Telegram channel to the user (no disk download first)
+TELEGRAM_STREAM = _b("TELEGRAM_STREAM", True)
 
 # ── Security ─────────────────────────────────────────────────
 KEY_ENC_SECRET = _s("KEY_ENC_SECRET")   # encrypts API keys stored in MongoDB
 TOKEN_SECRET = _s("TOKEN_SECRET")       # signs short-lived download tokens
 TOKEN_TTL = _i("TOKEN_TTL", 300)
+# Owner master key: unlimited quota, no daily limit, no per-minute limit. Keep it SECRET.
+_master_raw = _s("MASTER_KEY")
+MASTER_KEY_TOO_SHORT = bool(_master_raw) and len(_master_raw) < 24   # too weak -> ignored
+MASTER_KEY = "" if MASTER_KEY_TOO_SHORT else _master_raw
 
 # ── Limits / plans ───────────────────────────────────────────
-DAILY_LIMIT = _i("DAILY_LIMIT", 200)
+DAILY_LIMIT = _i("DAILY_LIMIT", 150)
 KEY_VALID_DAYS = _i("KEY_VALID_DAYS", 28)
 RESET_TZ = _s("RESET_TZ", "Asia/Kolkata")
 PLAN_NAME = _s("PLAN_NAME", "Free")
 RATE_PER_MIN = _i("RATE_PER_MIN", 10)   # per key, on token generation. 0 = off
 
 # ── Engine (protects the free server) ────────────────────────
-MIN_FREE_BYTES = _i("MIN_FREE_MB", 500) * 1024 * 1024
+MIN_FREE_BYTES = _i("MIN_FREE_MB", 200) * 1024 * 1024
 MAX_CONCURRENT_DOWNLOADS = max(1, _i("MAX_CONCURRENT_DOWNLOADS", 2))
-MAX_QUEUE = _i("MAX_QUEUE", 20)
+MAX_QUEUE = _i("MAX_QUEUE", 40)
 QUEUE_WAIT_SECONDS = _i("QUEUE_WAIT_SECONDS", 60)
 DOWNLOAD_TIMEOUT = _i("DOWNLOAD_TIMEOUT", 120)
-MAX_CONCURRENT_CACHE_READS = max(1, _i("MAX_CONCURRENT_CACHE_READS", 3))
+MAX_CONCURRENT_CACHE_READS = max(1, _i("MAX_CONCURRENT_CACHE_READS", 10))
 PROXIES_RAW = _list("PROXIES")
 MAX_PROXY_TRIES = max(1, _i("MAX_PROXY_TRIES", 3))
 
@@ -95,7 +102,7 @@ MONGO_DB = _s("MONGO_DB", "opusapi")
 # ── Telegram audio archive ───────────────────────────────────
 TELEGRAM_SESSION = _s("TELEGRAM_SESSION")
 TELEGRAM_CACHE_CHANNEL = _s("TELEGRAM_CACHE_CHANNEL")
-TELEGRAM_MAX_SONG_MB = _i("TELEGRAM_MAX_SONG_MB", 25)
+TELEGRAM_MAX_SONG_MB = _i("TELEGRAM_MAX_SONG_MB", 40)
 
 # ── Telegram key-manager bot ─────────────────────────────────
 BOT_TOKEN = _s("BOT_TOKEN")
@@ -113,3 +120,4 @@ START_MEDIA_TYPE = _s("START_MEDIA_TYPE", "auto").lower()  # auto | photo | vide
 STRINGS_FILE = _s("STRINGS_FILE")
 BROADCAST_DELAY = _f("BROADCAST_DELAY", 0.05)
 REMINDER_DAYS = _i("REMINDER_DAYS", 3)             # 0 = no expiry reminders
+TEST_MAX_MINUTES = _i("TEST_MAX_MINUTES", 10)      # /test refuses songs longer than this
