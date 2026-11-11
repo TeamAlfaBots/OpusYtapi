@@ -32,6 +32,15 @@ os.makedirs(os.environ["CACHE_DIR"])
 FAKE = '''#!/usr/bin/env python3
 import os, sys, time, glob
 a = sys.argv[1:]
+if "--print" in a:  # search mode: ytsearch3:<query>
+    q = a[-1].split(":", 1)[1]
+    if q.startswith("FAIL"):
+        sys.stderr.write("ERROR: boom")
+        sys.exit(1)
+    if q.startswith("NONE"):
+        sys.exit(0)
+    sys.stdout.write("dQw4w9WgXcQ\\tSong " + q + "\\t212\\tArtist\\n")
+    sys.exit(0)
 out = a[a.index("-o") + 1]
 vid = a[-1].split("v=")[-1]
 d = os.environ["FAKE_DIR"]
@@ -131,6 +140,91 @@ def test_bot_strings_exist():
     assert "&lt;b&gt;" in esc("<b>") and "Hey <b>A &amp; B</b>" in T("start", name=esc("A & B"))
 
 
+def test_range_parser():
+    pr = utils.parse_range
+    assert pr(None, 100) is None and pr("", 100) is None
+    assert pr("bytes=0-9", 100) == (0, 9)
+    assert pr("bytes=10-", 100) == (10, 99)
+    assert pr("bytes=-20", 100) == (80, 99)
+    assert pr("bytes=-500", 100) == (0, 99)          # suffix bigger than the file
+    assert pr("bytes=50-9999", 100) == (50, 99)      # end is clamped
+    assert pr("bytes=0-0", 100) == (0, 0)
+    assert pr("bytes=9-3", 100) is None              # invalid -> whole file
+    assert pr("bytes=0-1,5-6", 100) is None          # multi range ignored
+    assert pr("garbage", 100) is None and pr("bytes=-", 100) is None
+    for bad in ("bytes=100-", "bytes=500-600", "bytes=-0"):
+        try:
+            pr(bad, 100)
+            raise AssertionError("expected ValueError: " + bad)
+        except ValueError:
+            pass
+
+
+def test_telegram_stream_ranges():
+    """iter_range must return exactly the requested bytes, also across 1 MiB chunk borders."""
+    from OpusApi.database import telegram_cache as tc
+
+    data = bytes((i * 7) % 251 for i in range(int(2.5 * tc.CHUNK)))
+
+    class FakeClient:
+        async def stream_media(self, message, limit=0, offset=0):
+            n, pos = 0, offset * tc.CHUNK
+            while pos < len(data) and not (limit and n >= limit):
+                yield data[pos:pos + tc.CHUNK]
+                pos += tc.CHUNK
+                n += 1
+
+    async def run():
+        tc._client = FakeClient()
+        L = len(data)
+        for a, b in ((0, 0), (0, 9), (tc.CHUNK - 3, tc.CHUNK + 3), (5, L - 1), (L - 100, L - 1), (tc.CHUNK, 2 * tc.CHUNK - 1)):
+            got = b"".join([c async for c in tc.iter_range(None, a, b)])
+            assert got == data[a:b + 1], (a, b, len(got))
+        tc._client = None
+
+    asyncio.run(run())
+
+
+def test_search():
+    async def run():
+        r = await downloader.search_video("  hello   world ")
+        assert r["video_id"] == "dQw4w9WgXcQ" and r["duration"] == 212 and r["uploader"] == "Artist"
+        assert r["title"] == "Song hello world"            # whitespace collapsed
+        before = len(_calls())
+        await downloader.search_video("hello world")        # second time: from the memory cache
+        assert len(_calls()) == before
+        for bad, exc in (("x", downloader.DownloadError), ("NONEfound", downloader.DownloadError),
+                         ("FAILsearch", downloader.DownloadError)):
+            try:
+                await downloader.search_video(bad)
+                raise AssertionError("expected DownloadError for " + bad)
+            except exc as e:
+                assert "boom" not in str(e)
+        # an attacker-controlled name can never become a yt-dlp option
+        cmd = downloader._search_cmd("--exec evil", [], None)
+        assert cmd[-1] == "ytsearch3:--exec evil" and cmd.count("--exec evil") == 0
+
+    asyncio.run(run())
+
+
+def test_master_key_config():
+    import importlib
+    old = os.environ.get("MASTER_KEY")
+    try:
+        os.environ["MASTER_KEY"] = "short"
+        c = importlib.reload(config)
+        assert c.MASTER_KEY == "" and c.MASTER_KEY_TOO_SHORT          # weak key is ignored
+        os.environ["MASTER_KEY"] = "k" * 32
+        c = importlib.reload(config)
+        assert c.MASTER_KEY == "k" * 32 and not c.MASTER_KEY_TOO_SHORT
+    finally:
+        if old is None:
+            os.environ.pop("MASTER_KEY", None)
+        else:
+            os.environ["MASTER_KEY"] = old
+        importlib.reload(config)
+
+
 def _calls():
     path = os.path.join(TMP, "calls.log")
     return open(path).read().split() if os.path.exists(path) else []
@@ -206,3 +300,4 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 print("FAIL", name, e)
     sys.exit(1 if failed else 0)
+    
