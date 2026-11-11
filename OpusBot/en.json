@@ -1,6 +1,6 @@
 {
   "texts": {
-    "start": "👋 Hey <b>{name}</b>!\n\n<blockquote>This is the <b>OpusMusicAPI Manager</b> bot.\nGenerate your API key, check your usage, renew or revoke it, all from here.</blockquote>\n\n<blockquote expandable>🎵 Fast, cached YouTube audio for your Telegram music bots.\n<b>✦ What you can do here:\n➨ Generate your API key\n➨Check your usage stats\n➨Renew your key</b>\n</blockquote>👇 Tap a button below to continue.",
+    "start": "👋 Hey <b>{name}</b>!\n\n<blockquote>This is the <b>OpusMusicAPI Manager</b> bot.\nGenerate your API key, check your usage, renew or revoke it, all from here.</blockquote>\n\n<blockquote expandable>🎵 Fast, cached YouTube audio for your Telegram music bots.\n<b>✦ What you can do here:\n➨ Generate your API key\n➨Check your usage stats\n➨Renew your key\n➨Test any song with /test song name\n➨Read the API guide with /docs</b>\n</blockquote>👇 Tap a button below to continue.",
     "join_required": "🔒 <b>Join required</b>\n\nTo generate your API key, please join our channel(s) first:\n{channels}\n\nThen tap <b>✅ I've Joined</b>.",
     "join_error": "⚠️ I couldn't verify your channel membership right now. Please try again in a moment.",
     "join_still": "You haven't joined all the channels yet!",
@@ -36,7 +36,26 @@
     "owner_revoke_none": "⚠️ <b>No active key found</b>\n\n🆔 User: <code>{uid}</code>",
     "owner_setlimit_usage": "📊 <b>Set daily limit</b>\n\nUsage: <code>/setlimit user_id daily_limit</code>",
     "owner_setlimit_ok": "✅ <b>Limit updated</b>\n\n🆔 User: <code>{uid}</code>\n📊 Daily limit: <b>{limit}</b>",
-    "owner_setlimit_none": "⚠️ <b>User not found</b>\n\n🆔 User: <code>{uid}</code>"
+    "owner_setlimit_none": "⚠️ <b>User not found</b>\n\n🆔 User: <code>{uid}</code>",
+    "test_usage": "🎧 <b>Test the API</b>\n\nUsage: <code>/test song name</code>\nExample: <code>/test kesariya</code>\n\nI search the song, download it through the API and send it here. It uses <b>your own key and daily quota</b> (1 request), and the song is saved in the cache for instant re-streaming.",
+    "test_wait": "⏳ Your previous /test is still running. Please wait for it to finish.",
+    "test_nokey": "🔑 You need an API key first.\nTap <b>Generate API</b>, then try <code>/test song name</code> again.",
+    "test_expired": "🔴 Your API key has expired.\nTap <b>Renew Now</b>, then try again.",
+    "test_searching": "🔎 Searching <b>{query}</b>…",
+    "test_downloading": "⬇️ Downloading <b>{title}</b>…",
+    "test_uploading": "📤 Sending…",
+    "test_too_long": "⚠️ That song is longer than {minutes} minutes, /test skips it to save your quota. Try another name.",
+    "test_done": "🎵 <b>{title}</b>\n⏱ {length} · 🆔 <code>{video_id}</code>\n\n{source}\n{quota}",
+    "test_src_cache": "⚡ Source: cache (instant)",
+    "test_src_fresh": "⬇️ Source: fresh download (saved to the cache for next time when the cache is on)",
+    "test_quota": "📊 Quota left today: <b>{remaining}/{limit}</b>",
+    "test_quota_unlimited": "♾ Quota: <b>unlimited</b> (master key)",
+    "test_err_limit": "🚫 Your daily limit is finished. It resets at midnight, check <b>My API Key</b> for the time.",
+    "test_err_rate": "⏱ Too many requests. Wait a minute and try again.",
+    "test_err_busy": "🚧 The server is busy right now. Try again in a few seconds. You were not charged.",
+    "test_err_key": "🔑 Your API key is not valid. Open the key card and renew or generate a new one.",
+    "test_err_generic": "⚠️ Could not finish: {reason}\nIf the download failed you were not charged.",
+    "docs": "📚 <b>How to use the API in your bot</b>\n\n<b>Base URL:</b> <code>{base_url}</code>\nSend your key in the header <code>X-API-Key</code>.\n\n<b>1) Find a song (free)</b>\n<code>GET /v1/search?q=song name</code>\n→ <code>video_id</code>, title, duration\n\n<b>2) Get a token</b>\n<code>GET /v1/download?url=VIDEO_ID&amp;type=audio</code>\n→ <code>download_token</code> (valid 5 min)\n\n<b>3) Get the audio</b>\n<code>GET /v1/stream/VIDEO_ID</code> with header <code>X-Download-Token</code>\n→ the audio file (1 request is charged here)\n\n<b>Quick one-step:</b> <code>GET /download?url=VIDEO_ID&amp;type=audio&amp;api_key=KEY</code>\n\n<b>Check usage:</b> <code>GET /v1/me</code>\n\nTry it here: <code>/test song name</code>\nFull guide with code: DOCS.md in the repository."
   },
   "buttons": {
     "generate": "🔑 𝐆𝖾𝗇𝖾𝗋𝖺𝗍𝖾 𝖠𝖯𝖨",
