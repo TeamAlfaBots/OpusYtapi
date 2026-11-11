@@ -4,6 +4,9 @@ import csv
 import io
 import logging
 import math
+import os
+import tempfile
+import uuid
 from datetime import timedelta
 
 from pyrogram import errors, filters
@@ -231,6 +234,161 @@ async def on_callback(client, cq):
             pass
 
 
+# ── /test <song name>: search -> download via the API -> send in chat ──
+_test_busy = set()
+
+
+class _ApiError(Exception):
+    def __init__(self, code, message, status):
+        super().__init__(message)
+        self.code, self.message, self.status = code, message, status
+
+
+def _api_base() -> str:
+    return config.BASE_URL or f"http://127.0.0.1:{config.PORT}"
+
+
+async def _api_json(sess, path, key, **params):
+    async with sess.get(_api_base() + path, params=params, headers={"X-API-Key": key}) as r:
+        try:
+            data = await r.json(content_type=None)
+        except Exception:
+            data = {}
+        if r.status != 200 or not isinstance(data, dict) or data.get("status") != "success":
+            data = data if isinstance(data, dict) else {}
+            raise _ApiError(data.get("code", "error"), data.get("message", "Request failed"), r.status)
+        return data
+
+
+def _fmt_len(seconds: int) -> str:
+    return f"{seconds // 60}:{seconds % 60:02d}" if seconds else "-"
+
+
+def _test_error_text(e: _ApiError) -> str:
+    key = {"daily_limit": "test_err_limit", "rate_limited": "test_err_rate", "busy": "test_err_busy",
+           "invalid_key": "test_err_key", "key_expired": "test_err_key", "missing_key": "test_err_key"}.get(e.code)
+    return T(key) if key else T("test_err_generic", reason=esc(e.message[:200]))
+
+
+async def _run_test(client, message, key, query):
+    import aiohttp
+
+    uid = message.from_user.id
+    status = await message.reply_text(T("test_searching", query=esc(query[:80])))
+    path = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=240)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            found = await _api_json(sess, "/v1/search", key, q=query)
+            if found.get("duration", 0) > config.TEST_MAX_MINUTES * 60:
+                await status.edit_text(T("test_too_long", minutes=config.TEST_MAX_MINUTES))
+                return
+            await status.edit_text(T("test_downloading", title=esc(found["title"])))
+            info = await _api_json(sess, "/v1/download", key, url=found["video_id"], type="audio")
+            path = os.path.join(tempfile.gettempdir(), f"opus_test_{uuid.uuid4().hex[:10]}.audio")
+            # This is the call that is charged to the user's own quota (the cache is filled here too).
+            async with sess.get(
+                f"{_api_base()}/v1/stream/{found['video_id']}",
+                headers={"X-Download-Token": info["download_token"]},
+            ) as r:
+                if r.status != 200:
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        data = {}
+                    raise _ApiError(data.get("code", "error"), data.get("message", "Download failed"), r.status)
+                remaining, limit = r.headers.get("X-Requests-Remaining", "?"), r.headers.get("X-Daily-Limit", "?")
+                source = r.headers.get("X-Source", "download")
+                with open(path, "wb") as f:
+                    async for chunk in r.content.iter_chunked(256 * 1024):
+                        f.write(chunk)
+        await status.edit_text(T("test_uploading"))
+        quota = T("test_quota_unlimited") if remaining == "unlimited" else T("test_quota", remaining=remaining, limit=limit)
+        caption = T(
+            "test_done", title=esc(found["title"]), length=_fmt_len(found.get("duration", 0)),
+            source=T("test_src_cache" if source in ("disk", "telegram", "telegram-stream") else "test_src_fresh"),
+            quota=quota, video_id=found["video_id"],
+        )
+        await client.send_audio(
+            message.chat.id, path, caption=caption, title=found["title"][:60],
+            performer=(found.get("uploader") or None), duration=found.get("duration") or 0,
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+    except _ApiError as e:
+        try:
+            await status.edit_text(_test_error_text(e))
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("/test failed for %s: %s", uid, e)
+        try:
+            await status.edit_text(T("test_err_generic", reason=T("generic_error")))
+        except Exception:
+            pass
+    finally:
+        _test_busy.discard(uid)
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def test_cmd(client, message):
+    user = message.from_user
+    if not user:
+        return
+    parts = (message.text or "").split(None, 1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    if not query:
+        await message.reply_text(T("test_usage"), reply_markup=K.close_menu())
+        return
+    if user.id in _test_busy:
+        await message.reply_text(T("test_wait"))
+        return
+    if config.FORCE_CHANNELS:
+        missing, failed = await missing_channels(client, user.id)
+        if failed:
+            await message.reply_text(T("join_error"))
+            return
+        if missing:
+            await message.reply_text(
+                T("join_required", channels="\n".join(f"• @{c}" for c in missing)), reply_markup=K.join_menu(missing)
+            )
+            return
+
+    if user.id in config.OWNER_IDS and config.MASTER_KEY:
+        key = config.MASTER_KEY          # owners test with the unlimited master key
+    else:
+        doc = await mongo.get_user(user.id)   # everyone else is charged on their OWN key and quota
+        state = key_state(doc)
+        if state in ("none", "revoked"):
+            await message.reply_text(T("test_nokey"), reply_markup=K.start_menu())
+            return
+        if state == "expired":
+            await message.reply_text(T("test_expired"), reply_markup=K.reminder_menu())
+            return
+        key = security.decrypt_key(doc.get("key_enc"))
+        if not key:
+            await message.reply_text(T("key_hidden"))
+            return
+
+    _test_busy.add(user.id)
+    task = asyncio.create_task(_run_test(client, message, key, query))  # do not block other updates
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+async def docs_cmd(client, message):
+    await message.reply_text(
+        T("docs", base_url=esc(config.BASE_URL or "https://your-api.example.com")),
+        reply_markup=K.close_menu(),
+    )
+
+
 # ── owner tools ──────────────────────────────────────────────
 async def _users_page(page: int):
     counts = await mongo.user_counts()
@@ -355,51 +513,4 @@ async def broadcast_cmd(client, message):
     try:
         ids = await mongo.broadcast_ids()
         status = await message.reply_text(T("owner_broadcast_start", total=len(ids)))
-    except Exception:
-        _broadcast_running = False
-        raise
-    task = asyncio.create_task(
-        _run_broadcast(client, status, ids, message.chat.id, reply.id if reply else None,
-                       None if reply else text)
-    )
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
-
-
-# ── expiry reminders ─────────────────────────────────────────
-async def reminder_loop(client):
-    while True:
-        try:
-            await asyncio.sleep(120)
-            now = utils.now_utc()
-            for doc in await mongo.users_to_remind(now, timedelta(days=config.REMINDER_DAYS)):
-                try:
-                    await client.send_message(
-                        doc["_id"],
-                        T("reminder", valid_till=utils.fmt_dt(doc["expires_at"])),
-                        reply_markup=K.reminder_menu(),
-                    )
-                except _BLOCK_ERRORS:
-                    await mongo.set_blocked(doc["_id"], True)
-                except Exception as e:
-                    log.warning("reminder to %s failed: %s", doc["_id"], e)
-                await mongo.mark_reminded(doc["_id"], doc["expires_at"])
-                await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("reminder loop error: %s", e)
-        await asyncio.sleep(3600)
-
-
-# ── wiring ───────────────────────────────────────────────────
-def register(app):
-    private = filters.private
-    app.add_handler(MessageHandler(start_cmd, filters.command("start") & private))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    if config.OWNER_IDS:
-        owner = private & filters.user(config.OWNER_IDS)
-        app.add_handler(MessageHandler(broadcast_cmd, filters.command("broadcast") & owner))
-        app.add_handler(MessageHandler(users_cmd, filters.command("users") & owner))
-        app.add_handler(MessageHandler(revoke_cmd, filters.command("revoke") & owner))
-        app.add_handler(MessageHandler(setlimit_cmd, filters.command("setlimit") & owner))
+    except E
